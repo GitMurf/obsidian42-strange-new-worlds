@@ -32,3 +32,5 @@ build
 ehthumbs.db
 Thumbs.db
 
+# allow for local dev folder that won't be committed
+local-dev
