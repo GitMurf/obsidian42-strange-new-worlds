@@ -60,9 +60,10 @@ export default class SNWPlugin extends Plugin {
         this.registerView(VIEW_TYPE_SNW, (leaf) => new SideBarPaneView(leaf, this));
 
         //initial index building
+        const indexerDebounceTimerMs = this.settings.cacheUpdateInMilliseconds ?? 2_000;
         const indexDebounce = debounce((type: 'full' | 'partial' = 'partial') => {
             buildLinksAndReferences(type);
-        }, 1000, true);
+        }, indexerDebounceTimerMs, true);
 
         // TODO: probably still want to keep metadataCache.on("resolve") in case non-editor change triggers a file update
         this.registerEvent(this.app.metadataCache.on("resolve", () => {
