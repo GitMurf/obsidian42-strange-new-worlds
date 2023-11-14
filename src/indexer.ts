@@ -1,6 +1,6 @@
 // This module builds on Obsidians cache to provide more specific link information
 
-import { CachedMetadata, HeadingCache, stripHeading, TFile, Pos, parseLinktext} from "obsidian";
+import { CachedMetadata, HeadingCache, stripHeading, TFile, Pos, parseLinktext, CacheItem} from "obsidian";
 import SNWPlugin from "./main";
 import {Link, TransformedCache} from "./types";
 
@@ -21,64 +21,311 @@ export function getSnwAllLinksResolutions(){
     return allLinkResolutions;
 }
 
+interface LinkResolutionCache {
+    reference: {
+        displayText: string,
+        link: string,
+        position: CacheItem['position']
+    },
+    resolvedFile: TFile | null,
+    ghostLink: string,
+    realLink: string,
+    sourceFile: TFile,
+    excludedFile: boolean
+}
+
+// compare ctime, mtime, size to see if any changes
+interface GlobalRefsCacheMapSrcFile {
+    srcFilePathString: string;
+    srcFile: TFile;
+    srcFileStats: {
+        ctime: number,
+        mtime: number,
+        size: number
+    }
+    srcFileIgnored: boolean;
+    linkReferenceCache: LinkResolutionCache[]
+}
+interface GlobalRefsCacheLinkLookup {
+    resolvedFilePath: ReturnType<typeof parseLinktext>,
+    resolvedTFile?: TFile,
+    fileLink?: string,
+    fileLinkIgnored?: boolean,
+    ghlink?: string
+}
+const globalRefsCache = {
+    globalRefsCacheMap: new Map<string, GlobalRefsCacheMapSrcFile>(),
+    refLinkResolutionCache: new Map<string, GlobalRefsCacheLinkLookup>()
+}
+
 /**
  * Buildings a optimized list of cache references for resolving the block count. 
  * It is only updated when there are data changes to the vault. This is hooked to an event
  * trigger in main.ts
  * @export
  */
-export function buildLinksAndReferences(): void {
+export function buildLinksAndReferences(type: 'full' | 'partial' = 'partial'): void {
     if(thePlugin.showCountsActive!=true) return;
     console.time('SNW: buildLinksAndReferences');
     
+    if(type==='full') {
+        console.log("SNW: buildLinksAndReferences > FULL REBUILD of Index");
+        references = {};
+        allLinkResolutions = [];
+        globalRefsCache.globalRefsCacheMap = new Map<string, GlobalRefsCacheMapSrcFile>();
+        globalRefsCache.refLinkResolutionCache = new Map<string, GlobalRefsCacheLinkLookup>();
+    }
+    const indexOptimizationStats = {
+        totalFiles: 0,
+        totalFilesIgnored: 0,
+        totalLinksIgnored: 0,
+        totalLinks: 0,
+        skippedFilesNoChanges: 0,
+        skippedFoundLinks: 0,
+        refsLinkLookup: 0,
+        finalLinksResolution: 0,
+        allLinksResolution: 0,
+        updateIndexNeededFalse: 0
+    }
     allLinkResolutions = [];
-    thePlugin.app.metadataCache.iterateReferences((src,refs)=>{ 
-        const resolvedFilePath = parseLinktext(refs.link);
-        if(resolvedFilePath.path==="") resolvedFilePath.path = src.replace(".md","");
-        if(resolvedFilePath?.path) {
-            const resolvedTFile = thePlugin.app.metadataCache.getFirstLinkpathDest(resolvedFilePath.path, "/");
-            const fileLink = resolvedTFile===null ?  "" : resolvedTFile.path.replace(".md","") + stripHeading(resolvedFilePath.subpath); // file doesnt exist, empty link
-            const ghlink = resolvedTFile===null ?  resolvedFilePath.path : ""; // file doesnt exist, its a ghost link
-            const sourceFile = thePlugin.app.metadataCache.getFirstLinkpathDest(src, "/");
+    // let ctr = 0;
+    // const buildListOfSkippedFilesNoChanges: string[] = [];
+    // const buildListOfIteratedFiles: {
+    //     srcFilePathString: string,
 
-            if(thePlugin.settings.enableIgnoreObsExcludeFoldersLinksFrom) 
-                if (thePlugin.app.metadataCache.isUserIgnored(sourceFile?.path ?? '')) 
-                    return;
+    // }[] = [];
+    const buildMapOfIteratedFiles = new Map<string, {
+        srcFilePathString: string,
+        updateIndexNeeded: boolean,
+        globalRefsCacheSrcFound?: GlobalRefsCacheMapSrcFile,
+        linkReferenceCache: LinkResolutionCache[]
+    }>();
 
-            if(thePlugin.settings.enableIgnoreObsExcludeFoldersLinksTo) 
-                if (thePlugin.app.metadataCache.isUserIgnored(fileLink)) 
-                    return;
-            
-            allLinkResolutions.push(
-                {
-                    reference: {
-                        displayText: refs.displayText ?? '',
-                        // link: refs.link, // old approach
-                        link: fileLink!="" ? fileLink : ghlink,
-                        position: refs.position
-                    },
-                    resolvedFile: resolvedTFile, 
-                    ghostLink: ghlink,
-                    realLink: refs.link,
-                    sourceFile:   sourceFile,
-                    excludedFile: false
+    console.time('SNW: buildLinksAndReferences > app.metadataCache.iterateReferences');
+    thePlugin.app.metadataCache.iterateReferences((src, refs) => {
+        indexOptimizationStats.totalLinks++;
+        // first idea: store files and their links as a map and see if anything changed, otherwise skip
+
+        // ctr++;
+        // if (ctr > 1_000) return;
+
+        let globalRefsCacheToUse: GlobalRefsCacheMapSrcFile | undefined;
+        let buildMapOfIteratedFilesToUse: ReturnType<typeof buildMapOfIteratedFiles.get>;
+        const buildMapOfIteratedFilesFound = buildMapOfIteratedFiles.get(src);
+        if (buildMapOfIteratedFilesFound) {
+            if (buildMapOfIteratedFilesFound.updateIndexNeeded === false) {
+                // console.log(
+                //     "SNW: buildLinksAndReferences > updateIndexNeeded === false",
+                //     src
+                // );
+                indexOptimizationStats.updateIndexNeededFalse++;
+                return;
+            }
+            buildMapOfIteratedFilesToUse = buildMapOfIteratedFilesFound;
+            globalRefsCacheToUse = buildMapOfIteratedFilesFound.globalRefsCacheSrcFound;
+        } else {
+            let skipNote: boolean = false;
+            const globalRefsCacheSrcFound = globalRefsCache.globalRefsCacheMap.get(src);
+            if (globalRefsCacheSrcFound) {
+                globalRefsCacheToUse = globalRefsCacheSrcFound;
+                if (
+                    globalRefsCacheSrcFound.srcFileStats.ctime ===
+                        globalRefsCacheSrcFound.srcFile.stat.ctime &&
+                    globalRefsCacheSrcFound.srcFileStats.mtime ===
+                        globalRefsCacheSrcFound.srcFile.stat.mtime &&
+                    globalRefsCacheSrcFound.srcFileStats.size ===
+                        globalRefsCacheSrcFound.srcFile.stat.size
+                ) {
+                    skipNote = true;
+                    indexOptimizationStats.skippedFilesNoChanges++;
                 }
-            )
-        }
-    }) 
+            } else {
+                const foundTFile = thePlugin.app.vault.getAbstractFileByPath(src);
+                if (foundTFile && foundTFile instanceof TFile) {
+                    globalRefsCache.globalRefsCacheMap.set(src, {
+                        srcFilePathString: src,
+                        srcFile: foundTFile,
+                        srcFileStats: {
+                            ctime: foundTFile.stat.ctime,
+                            mtime: foundTFile.stat.mtime,
+                            size: foundTFile.stat.size,
+                        },
+                        srcFileIgnored: thePlugin.app.metadataCache.isUserIgnored(
+                            foundTFile.path
+                        ),
+                        linkReferenceCache: [],
+                    });
+                    globalRefsCacheToUse = globalRefsCache.globalRefsCacheMap.get(src);
+                } else {
+                    // this ELSE should never be reached, but using for type narrowing above to TFile instead of TFolder
+                    console.log(
+                        "SNW: buildLinksAndReferences > foundTFile > NOT FOUND > This should NOT actually happen!"
+                    );
+                }
+            }
 
+            buildMapOfIteratedFilesToUse = {
+                srcFilePathString: src,
+                updateIndexNeeded: true,
+                globalRefsCacheSrcFound: globalRefsCacheToUse,
+                linkReferenceCache: [],
+            };
+            buildMapOfIteratedFiles.set(src, buildMapOfIteratedFilesToUse);
+            
+            indexOptimizationStats.totalFiles++;
+            if (skipNote) {
+                // console.log("**** SNW: buildLinksAndReferences > skipNote", src);
+                buildMapOfIteratedFilesToUse.updateIndexNeeded = false;
+                buildMapOfIteratedFiles.set(src, buildMapOfIteratedFilesToUse);
+                return;
+            }
+        }
+
+        if (!globalRefsCacheToUse) {
+            console.log(
+                "SNW: buildLinksAndReferences > globalRefsCacheToUse > NOT FOUND > This should NOT actually happen!"
+            );
+            return;
+        }
+
+        // console.log('ctr', ctr);
+        // console.time('SNW: buildLinksAndReferences > parseLinktext');
+        const refsLinkLookup = globalRefsCache.refLinkResolutionCache.get(refs.link);
+        const resolvedFilePath = !refsLinkLookup
+            ? parseLinktext(refs.link)
+            : refsLinkLookup.resolvedFilePath;
+
+        // console.timeEnd('SNW: buildLinksAndReferences > parseLinktext');
+        // console.log("resolvedFilePath", resolvedFilePath);
+        // spm: maybe removing the replace will save some time using some other way to get the file name
+        if (resolvedFilePath.path === "") resolvedFilePath.path = src.replace(".md", "");
+        if (!refsLinkLookup) {
+            globalRefsCache.refLinkResolutionCache.set(refs.link, {
+                resolvedFilePath,
+            });
+            indexOptimizationStats.refsLinkLookup++;
+        } else {
+            indexOptimizationStats.skippedFoundLinks++;
+        }
+        const refLinkResolutionCache = refsLinkLookup
+            ? refsLinkLookup
+            : globalRefsCache.refLinkResolutionCache.get(refs.link);
+        if (!refLinkResolutionCache) {
+            // mainly used for type narrowing
+            console.log(
+                "SNW: buildLinksAndReferences > refLinkResolutionCache > NOT FOUND > This should NOT actually happen!"
+            );
+            return;
+        }
+        // console.time('SNW: buildLinksAndReferences > resolvedFilePathIf');
+
+        if (resolvedFilePath?.path) {
+            const resolvedTFile =
+                refLinkResolutionCache.resolvedTFile ??
+                thePlugin.app.metadataCache.getFirstLinkpathDest(
+                    resolvedFilePath.path,
+                    "/"
+                );
+            // console.log("resolvedTFile", resolvedTFile);
+            const resolvedTFileIsNull = !resolvedTFile;
+            // console.log("resolvedTFileIsNull", resolvedTFileIsNull);
+            if (resolvedTFile && !refLinkResolutionCache.resolvedTFile)
+                refLinkResolutionCache.resolvedTFile = resolvedTFile;
+            // console.log("resolvedTFile", resolvedTFile);
+            const fileLink =
+                refLinkResolutionCache.fileLink ??
+                (resolvedTFileIsNull
+                    ? ""
+                    : resolvedTFile.path.replace(".md", "") +
+                      stripHeading(resolvedFilePath.subpath)); // file doesnt exist, empty link
+            if (!refLinkResolutionCache.fileLink) {
+                refLinkResolutionCache.fileLink = fileLink;
+                refLinkResolutionCache.fileLinkIgnored =
+                    thePlugin.app.metadataCache.isUserIgnored(fileLink);
+            }
+
+            const ghlink =
+                refLinkResolutionCache.ghlink ??
+                (resolvedTFileIsNull ? resolvedFilePath.path : ""); // file doesnt exist, its a ghost link
+            if (!refLinkResolutionCache.ghlink) refLinkResolutionCache.ghlink = ghlink;
+            const sourceFile = globalRefsCacheToUse.srcFile;
+
+            if (thePlugin.settings.enableIgnoreObsExcludeFoldersLinksFrom) {
+                if (globalRefsCacheToUse.srcFileIgnored) {
+                    indexOptimizationStats.totalFilesIgnored++;
+                    return;
+                }
+            }
+
+            if (thePlugin.settings.enableIgnoreObsExcludeFoldersLinksTo) {
+                if (refLinkResolutionCache.fileLinkIgnored) {
+                    indexOptimizationStats.totalLinksIgnored++;
+                    return;
+                }
+            }
+
+            const finalLinkResolution = {
+                reference: {
+                    displayText: refs.displayText ?? "",
+                    // link: refs.link, // old approach
+                    link: fileLink != "" ? fileLink : ghlink,
+                    position: refs.position,
+                },
+                resolvedFile: resolvedTFile,
+                ghostLink: ghlink,
+                realLink: refs.link,
+                sourceFile: sourceFile,
+                excludedFile: false,
+            };
+            // globalRefsCacheToUse.linkReferenceCache.push(finalLinkResolution);
+            buildMapOfIteratedFilesToUse.linkReferenceCache.push(finalLinkResolution);
+            indexOptimizationStats.finalLinksResolution++;
+            buildMapOfIteratedFiles.set(src, buildMapOfIteratedFilesToUse);
+            globalRefsCache.refLinkResolutionCache.set(refs.link, refLinkResolutionCache);
+        }
+        // console.timeEnd('SNW: buildLinksAndReferences > resolvedFilePathIf');
+    });
+    console.timeEnd("SNW: buildLinksAndReferences > app.metadataCache.iterateReferences");
+
+    console.time('SNW: buildLinksAndReferences > buildMapOfIteratedFiles.forEach');
+    // loop through the buildMapOfIteratedFiles and update the globalRefsCacheMap
+    buildMapOfIteratedFiles.forEach((value, key) => {
+        if(value.updateIndexNeeded===false) return;
+        const findGlobalRefsCacheMapSrcFile = globalRefsCache.globalRefsCacheMap.get(key);
+        if (findGlobalRefsCacheMapSrcFile) {
+            findGlobalRefsCacheMapSrcFile.linkReferenceCache = value.linkReferenceCache;
+            findGlobalRefsCacheMapSrcFile.srcFileStats = {
+                ctime: findGlobalRefsCacheMapSrcFile.srcFile.stat.ctime,
+                mtime: findGlobalRefsCacheMapSrcFile.srcFile.stat.mtime,
+                size: findGlobalRefsCacheMapSrcFile.srcFile.stat.size,
+            };
+            globalRefsCache.globalRefsCacheMap.set(key, findGlobalRefsCacheMapSrcFile);
+        }
+    })
+    console.timeEnd('SNW: buildLinksAndReferences > buildMapOfIteratedFiles.forEach');
 
     // START: Remove file exclusions for frontmatter snw-index-exclude
-    const snwIndexExceptionsList = Object.entries(app.metadataCache.metadataCache).filter((e)=>{
+    console.time('SNW: buildLinksAndReferences > snwIndexExceptionsList');
+    const snwIndexExceptionsList = Object.entries(thePlugin.app.metadataCache.metadataCache).filter((e)=>{
         return e[1]?.frontmatter?.["snw-index-exclude"]
     });
+    console.timeEnd('SNW: buildLinksAndReferences > snwIndexExceptionsList');
+    console.time('SNW: buildLinksAndReferences > snwIndexExceptions2');
     // TODO: should resolve these ts-expect-errors by declaring the types for non-exposed API items
     // @ts-expect-error - fileCache is not exposed in the API
-    const snwIndexExceptions = Object.entries(app.metadataCache.fileCache).filter((e)=>{
+    const snwIndexExceptions = Object.entries(thePlugin.app.metadataCache.fileCache).filter((e)=>{
         // @ts-expect-error - fileCache is not exposed in the API
         return snwIndexExceptionsList.find(f=>f[0]===e[1].hash);
     });
+    console.timeEnd('SNW: buildLinksAndReferences > snwIndexExceptions2');
 
+    console.time('SNW: buildLinksAndReferences > allLinkResolutions');
+    globalRefsCache.globalRefsCacheMap.forEach((value) => {
+        const linkReferenceCache = value.linkReferenceCache;
+        if(linkReferenceCache.length===0) return;
+        allLinkResolutions.push(...linkReferenceCache);
+        indexOptimizationStats.allLinksResolution += linkReferenceCache.length;
+    });
     for (let i = 0; i < allLinkResolutions.length; i++) {
         allLinkResolutions[i].excludedFile = false;
         if(allLinkResolutions[i]?.resolvedFile?.path){
@@ -92,9 +339,11 @@ export function buildLinksAndReferences(): void {
         } 
     }
     // END: Exclusions
+    console.timeEnd('SNW: buildLinksAndReferences > allLinkResolutions');
 
 
 
+    console.time('SNW: buildLinksAndReferences > reduce');
     const refs = allLinkResolutions.reduce((acc: {[x:string]: Link[]}, link : Link): { [x:string]: Link[] } => {
         let keyBasedOnLink = "";
         // let keyBasedOnFullPath = ""
@@ -122,6 +371,7 @@ export function buildLinksAndReferences(): void {
         // } 
         return acc;
     }, {});
+    console.timeEnd('SNW: buildLinksAndReferences > reduce');
 
 
     references = refs;
@@ -129,6 +379,7 @@ export function buildLinksAndReferences(): void {
     window.snwAPI.references = references;
     lastUpdateToReferences = Date.now();
     console.timeEnd('SNW: buildLinksAndReferences');
+    console.log("SNW: buildLinksAndReferences > indexOptimizationStats", indexOptimizationStats);
 }
 
 
@@ -164,7 +415,8 @@ export function getSNWCacheByFile(file: TFile): TransformedCache {
     }
 
     if (!references) {
-        buildLinksAndReferences();
+        console.log("SNW: getSNWCacheByFile > references not built yet > THIS SHOULD RARELY HAPPEN IF EVER");
+        buildLinksAndReferences('full');
     }
 
     const headings: string[] = Object.values(thePlugin.app.metadataCache.metadataCache).reduce((acc : string[], file : CachedMetadata) => {

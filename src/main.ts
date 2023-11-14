@@ -60,13 +60,23 @@ export default class SNWPlugin extends Plugin {
         this.registerView(VIEW_TYPE_SNW, (leaf) => new SideBarPaneView(leaf, this));
 
         //initial index building
-        const indexDebounce = debounce(() => {
-            buildLinksAndReferences()
+        const indexDebounce = debounce((type: 'full' | 'partial' = 'partial') => {
+            buildLinksAndReferences(type);
         }, 1000, true);
 
         // TODO: probably still want to keep metadataCache.on("resolve") in case non-editor change triggers a file update
-        this.registerEvent(this.app.metadataCache.on("resolve", indexDebounce ));
-        this.registerEvent(this.app.workspace.on("editor-change", indexDebounce ));
+        this.registerEvent(this.app.metadataCache.on("resolve", () => {
+            // console.log("metadataCache.on(resolve)");
+            indexDebounce('partial');
+        }));
+        this.registerEvent(this.app.workspace.on("editor-change", () => {
+            // console.log("editor-change");
+            indexDebounce('partial');
+        }));
+        this.registerEvent(this.app.workspace.on('active-leaf-change', () => {
+            console.log("active-leaf-change");
+            indexDebounce('full');
+        }));
 
         this.app.workspace.registerHoverLinkSource(this.appID, {
             display: this.appName,
@@ -87,7 +97,7 @@ export default class SNWPlugin extends Plugin {
                 await this.app.workspace.getRightLeaf(false).setViewState({type: VIEW_TYPE_SNW, active: false});
             }
             const resolved = this.app.metadataCache.on("resolved", async () => {
-                buildLinksAndReferences();
+                buildLinksAndReferences('full');
                 this.app.metadataCache.offref(resolved);
             });
         });
