@@ -29,6 +29,7 @@ export function getSnwAllLinksResolutions(){
  */
 export function buildLinksAndReferences(): void {
     if(thePlugin.showCountsActive!=true) return;
+    console.time('SNW: buildLinksAndReferences');
     
     allLinkResolutions = [];
     thePlugin.app.metadataCache.iterateReferences((src,refs)=>{ 
@@ -127,6 +128,7 @@ export function buildLinksAndReferences(): void {
     // @ts-ignore
     window.snwAPI.references = references;
     lastUpdateToReferences = Date.now();
+    console.timeEnd('SNW: buildLinksAndReferences');
 }
 
 
